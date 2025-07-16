@@ -1,5 +1,5 @@
 Flask
 PyPDF2
 cryptography
-pypiwin32
+msoffcrypto-tool
 Gunicorn
