@@ -3,19 +3,20 @@ import os
 import io
 import base64
 import tempfile
-import time
 from PyPDF2 import PdfReader, PdfWriter
 from cryptography.fernet import Fernet
-import win32com.client as win32
-import pythoncom
+import msoffcrypto
 
 app = Flask(__name__)
+
+# ----------------- Utilities -----------------
 
 def generate_cipher(password):
     key = base64.urlsafe_b64encode(password.encode().ljust(32, b'0'))
     return Fernet(key)
 
-# -------------------- ENCRYPTION --------------------
+# ----------------- PDF -----------------
+
 def encrypt_pdf(data, password):
     input_pdf = io.BytesIO(data)
     reader = PdfReader(input_pdf)
@@ -27,38 +28,6 @@ def encrypt_pdf(data, password):
     writer.write(output_pdf)
     return output_pdf.getvalue(), 'application/pdf', 'encrypted.pdf'
 
-def encrypt_text(data, password, ext):
-    cipher = generate_cipher(password)
-    encrypted_data = cipher.encrypt(data)
-    mime_map = {
-        '.csv': 'text/csv',
-        '.json': 'application/json',
-        '.xml': 'application/xml'
-    }
-    return encrypted_data, mime_map[ext], f'encrypted{ext}'
-
-def encrypt_excel(data, password):
-    with tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx') as temp_input:
-        temp_input.write(data)
-        input_path = temp_input.name
-
-    output_path = input_path.replace('.xlsx', '_encrypted.xlsx')
-    excel = win32.gencache.EnsureDispatch('Excel.Application')
-    excel.DisplayAlerts = False
-    wb = excel.Workbooks.Open(input_path)
-    wb.SaveAs(output_path, FileFormat=51, Password=password)
-    wb.Close(False)
-    excel.Quit()
-
-    with open(output_path, 'rb') as f:
-        encrypted_data = f.read()
-
-    os.remove(input_path)
-    os.remove(output_path)
-
-    return encrypted_data, 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 'encrypted.xlsx'
-
-# -------------------- DECRYPTION --------------------
 def decrypt_pdf(data, password):
     input_pdf = io.BytesIO(data)
     reader = PdfReader(input_pdf)
@@ -71,6 +40,18 @@ def decrypt_pdf(data, password):
     writer.write(output_pdf)
     return output_pdf.getvalue(), 'application/pdf', 'decrypted.pdf'
 
+# ----------------- CSV / JSON / XML -----------------
+
+def encrypt_text(data, password, ext):
+    cipher = generate_cipher(password)
+    encrypted_data = cipher.encrypt(data)
+    mime_map = {
+        '.csv': 'text/csv',
+        '.json': 'application/json',
+        '.xml': 'application/xml'
+    }
+    return encrypted_data, mime_map[ext], f'encrypted{ext}'
+
 def decrypt_text(data, password, ext):
     cipher = generate_cipher(password)
     decrypted_data = cipher.decrypt(data)
@@ -81,44 +62,34 @@ def decrypt_text(data, password, ext):
     }
     return decrypted_data, mime_map[ext], f'decrypted{ext}'
 
+# ----------------- Excel -----------------
+
 def decrypt_excel(data, password):
-    pythoncom.CoInitialize()
+    try:
+        decrypted = io.BytesIO()
+        office_file = msoffcrypto.OfficeFile(io.BytesIO(data))
+        office_file.load_key(password=password)
+        office_file.decrypt(decrypted)
+        decrypted.seek(0)
+        return decrypted.read(), 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 'decrypted.xlsx'
+    except Exception as e:
+        raise Exception(f"Excel decryption failed: {e}")
 
-    with tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx') as temp_input:
-        temp_input.write(data)
-        input_path = temp_input.name
+def encrypt_excel_generic(data, password):
+    try:
+        cipher = generate_cipher(password)
+        encrypted_data = cipher.encrypt(data)
+        return encrypted_data, 'application/octet-stream', 'encrypted_excel.bin'
+    except Exception as e:
+        raise Exception(f"Excel encryption failed: {e}")
 
-    output_path = input_path.replace('.xlsx', '_decrypted.xlsx')
-
-    excel = win32.gencache.EnsureDispatch('Excel.Application')
-    excel.DisplayAlerts = False
-    excel.Visible = False
-
-    wb = excel.Workbooks.Open(input_path, Password=password)
-    new_wb = excel.Workbooks.Add()
-    ws_src = wb.Worksheets(1)
-    ws_dst = new_wb.Worksheets(1)
-    ws_src.UsedRange.Copy(Destination=ws_dst.Range("A1"))
-
-    wb.Close(SaveChanges=False)
-    new_wb.SaveAs(output_path, FileFormat=51)
-    new_wb.Close(False)
-    excel.Quit()
-
-    with open(output_path, 'rb') as f:
-        decrypted_data = f.read()
-
-    os.remove(input_path)
-    os.remove(output_path)
-
-    return decrypted_data, 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 'decrypted.xlsx'
-
-# -------------------- ROUTES --------------------
+# ----------------- Routes -----------------
 
 @app.route('/encrypt', methods=['POST'])
 def encrypt_route():
     if 'file' not in request.files:
         return "❌ No file uploaded", 400
+
     file = request.files['file']
     password = request.form.get('password', 'rajesh')
     file_ext = os.path.splitext(file.filename)[1].lower()
@@ -126,15 +97,16 @@ def encrypt_route():
 
     try:
         if file_ext == '.pdf':
-            encrypted_data, mimetype, name = encrypt_pdf(data, password)
+            output_data, mimetype, name = encrypt_pdf(data, password)
         elif file_ext in ['.csv', '.json', '.xml']:
-            encrypted_data, mimetype, name = encrypt_text(data, password, file_ext)
+            output_data, mimetype, name = encrypt_text(data, password, file_ext)
         elif file_ext in ['.xls', '.xlsx']:
-            encrypted_data, mimetype, name = encrypt_excel(data, password)
+            # Encrypt Excel as binary file with Fernet (not native Excel encryption)
+            output_data, mimetype, name = encrypt_excel_generic(data, password)
         else:
             return "❌ Unsupported file type", 400
 
-        return send_file(io.BytesIO(encrypted_data), mimetype=mimetype, as_attachment=True, download_name=name)
+        return send_file(io.BytesIO(output_data), mimetype=mimetype, as_attachment=True, download_name=name)
     except Exception as e:
         return f"❌ Encryption failed: {e}", 500
 
@@ -142,6 +114,7 @@ def encrypt_route():
 def decrypt_route():
     if 'file' not in request.files:
         return "❌ No file uploaded", 400
+
     file = request.files['file']
     password = request.form.get('password', 'rajesh')
     file_ext = os.path.splitext(file.filename)[1].lower()
@@ -149,17 +122,20 @@ def decrypt_route():
 
     try:
         if file_ext == '.pdf':
-            decrypted_data, mimetype, name = decrypt_pdf(data, password)
+            output_data, mimetype, name = decrypt_pdf(data, password)
         elif file_ext in ['.csv', '.json', '.xml']:
-            decrypted_data, mimetype, name = decrypt_text(data, password, file_ext)
+            output_data, mimetype, name = decrypt_text(data, password, file_ext)
         elif file_ext in ['.xls', '.xlsx']:
-            decrypted_data, mimetype, name = decrypt_excel(data, password)
+            output_data, mimetype, name = decrypt_excel(data, password)
+        elif file_ext == '.bin':
+            # Decrypt previously encrypted Excel binary
+            output_data, mimetype, name = decrypt_text(data, password, '.xlsx')
         else:
             return "❌ Unsupported file type", 400
 
-        return send_file(io.BytesIO(decrypted_data), mimetype=mimetype, as_attachment=True, download_name=name)
+        return send_file(io.BytesIO(output_data), mimetype=mimetype, as_attachment=True, download_name=name)
     except Exception as e:
         return f"❌ Decryption failed: {e}", 500
 
 if __name__ == '__main__':
-    app.run(debug=True, port=5000)
+    app.run(host='0.0.0.0', port=5000)
