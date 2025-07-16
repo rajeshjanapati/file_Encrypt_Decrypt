@@ -92,7 +92,14 @@ def encrypt_route():
 
     file = request.files['file']
     password = request.form.get('password', 'rajesh')
-    file_ext = os.path.splitext(file.filename)[1].lower()
+
+    # Fallback: Use a default extension if filename is missing
+    filename = file.filename or 'file.pdf'  # default to PDF
+    file_ext = os.path.splitext(filename)[1].lower()
+
+    if not file_ext:
+        return "❌ Unable to determine file extension", 400
+
     data = file.read()
 
     try:
@@ -101,14 +108,19 @@ def encrypt_route():
         elif file_ext in ['.csv', '.json', '.xml']:
             output_data, mimetype, name = encrypt_text(data, password, file_ext)
         elif file_ext in ['.xls', '.xlsx']:
-            # Encrypt Excel as binary file with Fernet (not native Excel encryption)
             output_data, mimetype, name = encrypt_excel_generic(data, password)
         else:
-            return "❌ Unsupported file type", 400
+            return f"❌ Unsupported file type: {file_ext}", 400
 
-        return send_file(io.BytesIO(output_data), mimetype=mimetype, as_attachment=True, download_name=name)
+        return send_file(
+            io.BytesIO(output_data),
+            mimetype=mimetype,
+            as_attachment=True,
+            download_name=name
+        )
     except Exception as e:
-        return f"❌ Encryption failed: {e}", 500
+        return f"❌ Encryption failed: {str(e)}", 500
+
 
 @app.route('/decrypt', methods=['POST'])
 def decrypt_route():
